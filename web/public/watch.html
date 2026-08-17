@@ -104,6 +104,7 @@ const I18N = {
     mseFeedFailed: (msg) => "MSE 喂帧失败:" + msg,
     decodeFailed: (msg) => "解码失败：" + msg,
     decoderError: (msg) => "解码器错误：" + msg,
+    decoderRetryOtherAccel: (mode) => `${mode} 解码不可用，换其他解码档位重试…`,
     mseDecodeError: (msg) => "MSE 解码异常:" + msg,
     noHevcLanHttp: "LAN HTTP 下无法解码 H.265",
     noWebCodecs: "浏览器不支持 WebCodecs（请用 Chrome / Edge / Firefox 最新版）",
@@ -138,6 +139,7 @@ const I18N = {
     mseFeedFailed: (msg) => "Couldn't feed MSE: " + msg,
     decodeFailed: (msg) => "Couldn't decode: " + msg,
     decoderError: (msg) => "Decoder error: " + msg,
+    decoderRetryOtherAccel: (mode) => `${mode} decoding unavailable, retrying with another acceleration mode…`,
     mseDecodeError: (msg) => "MSE decode error: " + msg,
     noHevcLanHttp: "Can't decode H.265 over LAN HTTP",
     noWebCodecs: "Your browser doesn't support WebCodecs (please use the latest Chrome / Edge / Firefox)",
@@ -611,13 +613,23 @@ function avcCodecCandidates() {
   return out;
 }
 
-// Probe codec × hardwareAcceleration combos. On Linux Chrome, the VAAPI
-// path often reports `isConfigSupported=true` then errors on actual decode
-// ("Unsupported configuration" from the async error callback). Software
-// decode is more permissive, so we probe both modes and pick the first
-// that the browser fully accepts.
+// Probe codec × hardwareAcceleration combos and pick the first the browser
+// claims to accept.
+//
+// `isConfigSupported` is NOT trustworthy: on Linux Chrome the VAAPI path
+// routinely reports `supported: true`, accepts configure(), then emits zero
+// frames and fires the async error callback ("Decoding error.") — reproducible
+// on older Intel iGPUs. So support is only *provisionally* decided here;
+// the authoritative signal is whether a mode actually produced a frame, which
+// ensureDecoder() tracks. Modes falsified that way land in hwAccelBlacklist
+// and are skipped from then on (page-scoped: it's a property of the
+// browser/GPU, not of one stream, so it must survive reconnects).
+const HW_ACCEL_MODES = ["prefer-hardware", "prefer-software", "no-preference"];
+const hwAccelBlacklist = new Set();
+
 async function probeCodec(codec) {
-  for (const hwAccel of ["prefer-hardware", "prefer-software", "no-preference"]) {
+  for (const hwAccel of HW_ACCEL_MODES) {
+    if (hwAccelBlacklist.has(hwAccel)) continue;
     try {
       const sup = await VideoDecoder.isConfigSupported({
         codec,
@@ -681,8 +693,13 @@ async function ensureDecoder(firstKeyNAL, firstKeyTs) {
   const { codec: codecString, hwAccel } = pick;
   $("codec").textContent = `${codecHint} (${codecString}, ${hwAccel})`;
 
-  decoder = new VideoDecoder({
+  // 本 decoder 是否成功解出过帧 —— 这是 hwAccel 档位真正可用的唯一证据
+  // (isConfigSupported 会谎报,见 probeCodec 注释)。
+  let producedFrame = false;
+
+  const dec = new VideoDecoder({
     output: (frame) => {
+      producedFrame = true;
       try {
         if (canvas.width !== frame.displayWidth) {
           canvas.width = frame.displayWidth;
@@ -704,11 +721,27 @@ async function ensureDecoder(firstKeyNAL, firstKeyTs) {
       }
     },
     error: (e) => {
+      // 身份守卫:tearDown / 换档重建后,旧 decoder 的迟到 error 不该污染新状态。
+      if (dec !== decoder) return;
       console.error("decoder error", e);
+      // 一帧都没出就报错 → 该 hwAccel 档位实际不可用(典型:Linux VAAPI 谎报支持)。
+      // 拉黑它,还有候选档位时这是可恢复的:下一个 IDR 会用剩余档位重建解码器
+      // (后端 GOP=30,≈1.2s 一个关键帧),所以只给中性提示、不弹红。
+      if (!producedFrame) {
+        hwAccelBlacklist.add(hwAccel);
+        try { dec.close(); } catch {}
+        decoder = null;
+        configured = false;
+        if (HW_ACCEL_MODES.some((m) => !hwAccelBlacklist.has(m))) {
+          setState(t("decoderRetryOtherAccel", hwAccel));
+          return;
+        }
+      }
       setState(t("decoderError", e.message), true);
       configured = false;
     },
   });
+  decoder = dec;
 
   decoder.configure({
     codec: codecString,
