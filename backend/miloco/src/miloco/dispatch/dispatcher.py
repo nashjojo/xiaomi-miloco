@@ -100,6 +100,24 @@ class _QueuedEvent:
     delivered: "asyncio.Future[bool] | None" = None
 
 
+_CLOCK_GUARD_TMPL = (
+    "\n\n──\n"
+    "【时间基准】本条事件的权威时间为上方「时间」字段，当日日期为 {today}。"
+    "禁止由事件计数、间隔推算或上下文推断当前时间；需要当前时间时必须实际执行 date。"
+    "禁止创建或写入日期晚于 {today} 的文件。"
+)
+
+
+def _clock_guard() -> str:
+    """派发文本尾部的时间基准声明。
+
+    规则派发的「时间」字段只有时分秒（见 rule/runner.py），agent 一旦改用事件计数
+    推算时间，漂移跨过午夜后 payload 里没有任何信息与之矛盾——曾由此产生伪造未来
+    日期记录的自续写循环。这里补上权威日期，每次投递实时取值，跨天自动跟上。
+    """
+    return _CLOCK_GUARD_TMPL.format(today=time.strftime("%Y-%m-%d"))
+
+
 def _resolve_delivered(fut: "asyncio.Future[bool] | None", ok: bool) -> None:
     """resolve 投递结果 future；未传或已 done（如调用方守护超时后取消）则跳过。"""
     if fut is not None and not fut.done():
@@ -291,6 +309,9 @@ class AgentDispatcher:
             if not msg:
                 # builder 返回 None/空 → 无内容可发，跳过该批。
                 return
+            # 只加在投递路径上：builder 与入库文本（meaningful_events.text，面板展示用）
+            # 共用，在 builder 里加会污染 DB 与 UI。
+            msg = f"{msg}{_clock_guard()}"
 
             # drainer 不在感知 cycle 上下文，为每批次生成独立 trace_id（批次:run 1:1）。
             trace_id = str(uuid.uuid4())
